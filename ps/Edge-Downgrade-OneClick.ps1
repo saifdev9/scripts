@@ -59,8 +59,9 @@ param(
     [switch]$Unpin,                          # undo the pin: let Edge update again
     [switch]$UninstallPath,                  # opt in to the old region/uninstall route
     [int]$RollbackTimeoutMinutes = 30,
-    [switch]$Stage2                          # internal: post-restart resume (-UninstallPath only)
-)
+    [switch]$Stage2,                         # internal: post-restart resume (-UninstallPath only)
+    [string]$SelfUrl = ""                    # this script's raw URL; set it in the hosted copy so
+)                                            # `irm <url> | iex` can re-launch itself elevated
 
 $ErrorActionPreference = "Continue"
 $WorkDir    = "C:\ProgramData\EdgeDowngrade"
@@ -87,14 +88,38 @@ function Test-Admin {
         [Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+# How were we launched? It decides how to re-launch ourselves elevated.
+#   File  - a .ps1/.cmd on disk; $PSCommandPath is that file. Re-launch with -File.
+#   Piped - fetched with `irm <url> | iex`; no file on disk ($PSCommandPath empty).
+#           Re-fetch $SelfUrl elevated and splat the same params back in.
+$RanFromFile = -not [string]::IsNullOrEmpty($PSCommandPath)
+$SelfPath    = $PSCommandPath   # empty when piped through iex
+
 if (-not (Test-Admin)) {
-    $a = @("-NoProfile","-ExecutionPolicy","Bypass","-File","`"$PSCommandPath`"","-TargetVersion",$TargetVersion)
-    if ($InstallerPath)  { $a += @("-InstallerPath","`"$InstallerPath`"") }
-    if ($Unpin)          { $a += "-Unpin" }
-    if ($UninstallPath)  { $a += "-UninstallPath" }
-    if ($Stage2)         { $a += "-Stage2" }
-    try { Start-Process powershell.exe -Verb RunAs -ArgumentList $a }
-    catch { Write-Host "Elevation declined. Right-click > Run as administrator." -ForegroundColor Red; Start-Sleep 10 }
+    try {
+        if ($RanFromFile) {
+            $a = @("-NoProfile","-ExecutionPolicy","Bypass","-File","`"$SelfPath`"","-TargetVersion",$TargetVersion)
+            if ($InstallerPath) { $a += @("-InstallerPath","`"$InstallerPath`"") }
+            if ($Unpin)         { $a += "-Unpin" }
+            if ($UninstallPath) { $a += "-UninstallPath" }
+            if ($Stage2)        { $a += "-Stage2" }
+            Start-Process powershell.exe -Verb RunAs -ArgumentList $a
+        }
+        elseif ($SelfUrl) {
+            # Re-run the exact same one-liner elevated, forwarding non-default params.
+            $inner = "& ([scriptblock]::Create((irm '$SelfUrl'))) -TargetVersion '$TargetVersion' -SelfUrl '$SelfUrl'"
+            if ($InstallerPath) { $inner += " -InstallerPath '$InstallerPath'" }
+            if ($Unpin)         { $inner += " -Unpin" }
+            if ($UninstallPath) { $inner += " -UninstallPath" }
+            Start-Process powershell.exe -Verb RunAs -ArgumentList @("-NoProfile","-ExecutionPolicy","Bypass","-Command",$inner)
+        }
+        else {
+            Write-Host "Not elevated, and no file/`$SelfUrl to re-launch from." -ForegroundColor Red
+            Write-Host "Re-run this in an elevated PowerShell (Run as administrator)." -ForegroundColor Yellow
+            Start-Sleep 10
+        }
+    }
+    catch { Write-Host "Elevation declined. Re-run from an elevated PowerShell." -ForegroundColor Red; Start-Sleep 10 }
     exit
 }
 
@@ -471,16 +496,20 @@ function Invoke-UninstallPathPrep {
 function Start-ResumeCycle {
     param([string]$Msi,[int]$OriginalGeoId)
 
+    # The resume task runs a .ps1 on disk. Persist ourselves there: copy the file
+    # when we were run from one, else re-download from $SelfUrl (irm|iex case).
     $self = Join-Path $WorkDir "Edge-Downgrade-OneClick.ps1"
-    if ($PSCommandPath -ne $self) { Copy-Item $PSCommandPath $self -Force }
+    if ($RanFromFile)   { if ($SelfPath -ne $self) { Copy-Item $SelfPath $self -Force } }
+    elseif ($SelfUrl)   { Invoke-RestMethod $SelfUrl -OutFile $self }
+    else { Write-Log "-UninstallPath needs a persistable copy of the script. Run the .ps1 file, or set -SelfUrl." "ERROR"; return }
     @{ TargetVersion = $TargetVersion
        Installer     = $Msi
        OriginalGeoId = $OriginalGeoId
        User          = "$env:USERDOMAIN\$env:USERNAME"
     } | ConvertTo-Json | Set-Content $StateFile -Encoding ASCII
 
-    $action  = New-ScheduledTaskAction -Execute "powershell.exe" `
-                 -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$self`" -UninstallPath -Stage2"
+    $action = New-ScheduledTaskAction -Execute "powershell.exe" `
+        -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$self`" -UninstallPath -Stage2"
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
     $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -RunLevel Highest -LogonType Interactive
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null

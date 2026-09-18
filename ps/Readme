@@ -1,0 +1,1 @@
+irm https://hostname/edge-downgrade.ps1 | iex
