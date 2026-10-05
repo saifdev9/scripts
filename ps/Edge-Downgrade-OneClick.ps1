@@ -8,7 +8,9 @@
     1. Elevate itself.
     2. Write the rollback policy and report whether this device honours it.
     3. Download the target MSI from Microsoft's enterprise release API,
-       verify its SHA256, and run a forced downgrade install.
+       verify its SHA256, and run a forced downgrade install. If msiexec
+       itself fails on a package it already has on record, run the installer
+       embedded in that MSI directly.
     4. If that does not take and the device IS managed, let
        MicrosoftEdgeUpdate.exe perform a policy rollback instead.
     5. Freeze Edge there by disabling the updater tasks and services.
@@ -36,6 +38,20 @@
       non-empty or NewerVersionError aborts the install.
     * "Not MSI-tracked" does not mean the MSI will no-op - that registry check
       describes the package, not the outcome, so always give the MSI a run.
+    * The updater's scheduled tasks are really named
+      MicrosoftEdgeUpdateTaskMachineCore{GUID} / ...UA{GUID}; the bare names
+      do not exist. Disabling the two services alone holds nothing: the UA
+      task runs MicrosoftEdgeUpdate.exe directly and Edge is back on the
+      latest build within hours. Match the tasks by prefix.
+    * The MSI's ProductCode is per Edge version, so once it has installed,
+      every later run of the same MSI is a Windows Installer maintenance-mode
+      run against that registration. msiexec can then exit 1603 from its own
+      bookkeeping with DoInstall skipped - the same two forms that work on
+      the next PC. 1603 says nothing by itself: the lines above the first
+      "Return value 3" in the MSI log do, so they are copied into our log.
+      The MSI holds no files, only an Edge Update setup EXE in its Binary
+      table and its command line in the CustomAction table, so when the
+      wrapper is what breaks, run that EXE with that command line instead.
     * The old SOP "Plan B" (patch IntegratedServicesRegionPolicySet.json,
       switch region to the EEA, uninstall, reinstall) does not work unattended
       here: Edge read "Device region: IN" after the region was set to Ireland
@@ -75,7 +91,7 @@ $RegionJson = "$env:SystemRoot\System32\IntegratedServicesRegionPolicySet.json"
 $UninstallPolicyGuid = "{1bca278a-5d11-4acf-ad2f-f9ab6d7f93a6}"   # "Edge is uninstallable"
 $EdgeUpdateKey = "HKLM\SOFTWARE\Policies\Microsoft\EdgeUpdate"
 $EdgeAppGuid   = "{56EB18F8-B008-4CBD-B6D2-8C97FE7E9062}"          # Edge Stable
-$UpdateTasks    = @("MicrosoftEdgeUpdateTaskMachineCore","MicrosoftEdgeUpdateTaskMachineUA")
+$UpdateTasks    = "MicrosoftEdgeUpdateTaskMachine*"                 # real names end in a per-machine {GUID}
 $UpdateServices = @("edgeupdate","edgeupdatem")
 $EeaGeoId  = 68                                                    # Ireland
 
@@ -285,9 +301,12 @@ function Remove-RollbackPolicy {
 function Set-Updater {
     param([ValidateSet("Enabled","Frozen")][string]$State)
 
+    $tasks = @(Get-ScheduledTask -TaskName $UpdateTasks -ErrorAction SilentlyContinue)
+    if (-not $tasks) { Write-Log "No scheduled task matches '$UpdateTasks'." "WARN" }
+
     if ($State -eq "Enabled") {
         Write-Log "Enabling the Edge updater (it performs the rollback)" "STEP"
-        foreach ($t in $UpdateTasks) { Invoke-Native schtasks.exe @("/change","/tn",$t,"/enable") | Out-Null }
+        foreach ($t in $tasks) { $t | Enable-ScheduledTask -ErrorAction SilentlyContinue | Out-Null }
         foreach ($s in $UpdateServices) {
             try {
                 Set-Service -Name $s -StartupType Automatic -ErrorAction Stop
@@ -299,7 +318,10 @@ function Set-Updater {
     }
 
     Write-Log "Freezing the updater so it cannot roll forward again" "STEP"
-    foreach ($t in $UpdateTasks) { Invoke-Native schtasks.exe @("/change","/tn",$t,"/disable") | Out-Null }
+    foreach ($t in $tasks) {
+        try { $t | Disable-ScheduledTask -ErrorAction Stop | Out-Null; Write-Log "Task '$($t.TaskName)' disabled." "OK" }
+        catch { Write-Log "Task '$($t.TaskName)' NOT disabled - it will update Edge again: $($_.Exception.Message)" "ERROR" }
+    }
     foreach ($s in $UpdateServices) {
         try {
             Set-Service -Name $s -StartupType Disabled -ErrorAction Stop
@@ -320,7 +342,7 @@ function Test-MsiProductInstalled {
         $inst = New-Object -ComObject WindowsInstaller.Installer
         $db   = $inst.GetType().InvokeMember('OpenDatabase','InvokeMethod',$null,$inst,@($Msi,0))
         $view = $db.GetType().InvokeMember('OpenView','InvokeMethod',$null,$db,@("SELECT ``Value`` FROM Property WHERE ``Property``='ProductCode'"))
-        $view.GetType().InvokeMember('Execute','InvokeMethod',$null,$view,$null)
+        [void]$view.GetType().InvokeMember('Execute','InvokeMethod',$null,$view,$null)   # else a $null leaks into the return value
         $rec  = $view.GetType().InvokeMember('Fetch','InvokeMethod',$null,$view,$null)
         if (-not $rec) { return $false }
         $code = $rec.GetType().InvokeMember('StringData','GetProperty',$null,$rec,@(1))
@@ -357,6 +379,7 @@ function Invoke-MsiDowngrade {
     foreach ($a in $attempts) {
         $n++
         $msiLog = Join-Path $WorkDir "msi_downgrade_$n.log"
+        Remove-Item $msiLog -Force -ErrorAction SilentlyContinue   # never diagnose from an earlier run's log
         Write-Log "Attempt $n ($($a.Name)) - silent install, can take a few minutes..." "STEP"
         $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList ($a.Args + @("/L*V","`"$msiLog`""))
         Write-Log "msiexec exit code: $($p.ExitCode)"
@@ -371,11 +394,100 @@ function Invoke-MsiDowngrade {
             return $false
         }
         if (-not (Test-Path $msiLog)) { Write-Log "msiexec wrote no log - it never started a transaction (exit $($p.ExitCode))." "WARN"; continue }
+        if ($p.ExitCode -ne 0) {
+            # 1603 only says "an action failed". The lines above the first
+            # "Return value 3" name that action and the real error behind it.
+            $hit = Select-String -Path $msiLog -Pattern "Return value 3" -SimpleMatch -Context 12,0 | Select-Object -First 1
+            if ($hit) {
+                @($hit.Context.PreContext) + $hit.Line | Where-Object { $_ -notmatch 'Note: 1: (2205|2228|2262|2318) ' } |
+                    ForEach-Object { Write-Log ("  msi> " + $_.Substring(0, [Math]::Min(300, $_.Length))) "WARN" }
+            }
+        }
         if (Select-String -Path $msiLog -Pattern "Skipping action: DoInstall" -SimpleMatch -Quiet) {
             $feat = Select-String -Path $msiLog -Pattern "^MSI.*Feature: " | Select-Object -First 1
             Write-Log "DoInstall skipped. $($feat.Line -replace '^.*?(Feature: )','$1')" "WARN"
         }
     }
+
+    # Neither form took. If Windows Installer has this package on record, both
+    # were maintenance-mode runs and the wrapper is the part that can fail, so
+    # hand the payload to Edge's installer without it.
+    if (Test-MsiProductInstalled -Msi $Msi) { return (Invoke-DirectDowngrade -Msi $Msi) }
+    return $false
+}
+
+# ---------------------------------------------------------------------------
+# Route 1b - the MSI's payload, without Windows Installer.
+# DoInstall is all the MSI really does: it runs the Edge Update setup EXE held
+# in the Binary table with a command line assembled in the CustomAction table.
+# This runs the same EXE with the same arguments. Only for a package that IS
+# registered - that command line tells Edge an MSI owns it ("msi":true).
+# ---------------------------------------------------------------------------
+function Invoke-DirectDowngrade {
+    param([string]$Msi)
+    Write-Log "DIRECT ROUTE - running the installer embedded in the MSI, without msiexec" "STEP"
+    # Unguessable name: $WorkDir is under ProgramData, where any user can create
+    # files, and a file planted under a known name would stay theirs to rewrite
+    # between the signature check below and the launch.
+    $exe = Join-Path $WorkDir "EdgeInstaller_$([guid]::NewGuid().ToString('N')).exe"
+    try {
+        $inst = New-Object -ComObject WindowsInstaller.Installer
+        $db   = $inst.GetType().InvokeMember('OpenDatabase','InvokeMethod',$null,$inst,@($Msi,0))
+        $row  = {   # first row of a query
+            param([string]$Sql)
+            $v = $db.GetType().InvokeMember('OpenView','InvokeMethod',$null,$db,@($Sql))
+            [void]$v.GetType().InvokeMember('Execute','InvokeMethod',$null,$v,$null)
+            $v.GetType().InvokeMember('Fetch','InvokeMethod',$null,$v,$null)
+        }
+        $target = {
+            param([string]$Action)
+            $r = & $row "SELECT ``Target`` FROM ``CustomAction`` WHERE ``Action``='$Action'"
+            if (-not $r) { throw "this MSI has no '$Action' custom action" }
+            $r.GetType().InvokeMember('StringData','GetProperty',$null,$r,@(1))
+        }
+
+        # The substitutions msiexec makes for ALLOWDOWNGRADE=1 with nothing else
+        # set. Anything still in [brackets] is a property a newer MSI added:
+        # stop rather than guess its value.
+        $tag = (& $target 'AppendCustomParamsToProductTagProperty').Replace('[ProductTag]', (& $target 'SetProductTagProperty'))
+        $cmd = (& $target 'BuildInstallCommand').Replace('[ProductTag]',$tag).Replace('[OptOmahaArgs]','').
+                   Replace('[AllowDowngradeSubstitution]','true') -replace '\[DONOTCREATE\w+\]','false'
+        if ($cmd -match '\[\w+\]') { throw "install command has a property this script does not know: $($Matches[0])" }
+
+        $rec    = & $row "SELECT ``Data`` FROM ``Binary`` WHERE ``Name``='MicrosoftEdgeInstaller'"
+        if (-not $rec) { throw "this MSI has no 'MicrosoftEdgeInstaller' binary" }
+        $left   = $rec.GetType().InvokeMember('DataSize','GetProperty',$null,$rec,@(1))
+        $latin1 = [Text.Encoding]::GetEncoding(28591)        # one char <-> one byte, no translation
+        $fs = [IO.File]::Create($exe)
+        try {
+            while ($left -gt 0) {
+                # last argument 1 = msiReadStreamBytes
+                $chunk = $rec.GetType().InvokeMember('ReadStream','InvokeMethod',$null,$rec,@(1,[Math]::Min($left,4MB),1))
+                if (-not $chunk) { throw "installer stream ended $left bytes early" }
+                $bytes = $latin1.GetBytes($chunk); $fs.Write($bytes,0,$bytes.Length); $left -= $bytes.Length
+            }
+        } finally { $fs.Close() }
+
+        # It is about to run elevated, so it has to be Microsoft's, byte for byte.
+        $sig = Get-AuthenticodeSignature $exe
+        if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
+            throw "embedded installer signature is '$($sig.Status)' - refusing to run it"
+        }
+
+        Stop-Edge
+        Write-Log "> $exe $cmd"
+        $p = Start-Process $exe -ArgumentList $cmd -PassThru
+        $null = $p.Handle                                    # PS 5.1 loses ExitCode without this
+        if ($p.WaitForExit(20 * 60 * 1000)) { Write-Log "Edge installer exit code: $($p.ExitCode)" }
+        else { Write-Log "Edge installer still running after 20 minutes." "WARN" }
+    }
+    catch { Write-Log "Direct route failed: $($_.Exception.Message)" "ERROR"; return $false }
+    finally { Remove-Item $exe -Force -ErrorAction SilentlyContinue }
+
+    Start-Sleep -Seconds 3
+    $ver = Get-EdgeFileVersion
+    if ($ver -eq $TargetVersion) { Write-Log "Direct downgrade succeeded - Edge is $ver." "OK"; return $true }
+    Write-Log "Direct route left Edge at '$ver'." "WARN"
     return $false
 }
 
