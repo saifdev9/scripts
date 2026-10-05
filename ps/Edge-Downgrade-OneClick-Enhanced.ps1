@@ -44,7 +44,7 @@ $LogFile = Join-Path $WorkDir ("log_{0:yyyyMMdd_HHmmss}.txt" -f (Get-Date))
 function Write-Log {
     param([string]$Message,[string]$Level="INFO")
     $line = "{0:HH:mm:ss} [{1}] {2}" -f (Get-Date), $Level, $Message
-    $color = @{"OK"="Green";"WARN"="Yellow";"ERROR"="Red";"STEP"="Cyan"}[$Level] ?? "Gray"
+    $color = if ($null -ne @{"OK"="Green";"WARN"="Yellow";"ERROR"="Red";"STEP"="Cyan"}[$Level]) { @{"OK"="Green";"WARN"="Yellow";"ERROR"="Red";"STEP"="Cyan"}[$Level] } else { "Gray" }
     Write-Host $line -ForegroundColor $color
     Add-Content -Path $LogFile -Value $line -EA SilentlyContinue
 }
@@ -360,11 +360,11 @@ try {
 
 # Final summary
 Write-Log "========================================" "STEP"
-Write-Log "✓ COMPLETE: Edge downgraded to $TargetVersion" "OK"
-Write-Log "✓ Freeze enforced (multi-layer)" "OK"
-Write-Log "✓ Maintenance task active (hourly enforcement)" "OK"
+Write-Log "[DONE] Edge downgraded to $TargetVersion" "OK"
+Write-Log "[DONE] Freeze enforced (multi-layer)" "OK"
+Write-Log "[OK] Maintenance task active (hourly enforcement)" "OK"
 Write-Log "Log: $LogFile" "INFO"
 Write-Log "========================================" "STEP"
-Write-Log "System will stay frozen until you run: -Unpin" "INFO"
+Write-Log "System will stay frozen until you run: powershell -File ... -Unpin" "INFO"
 
 Start-Sleep -Seconds 3
